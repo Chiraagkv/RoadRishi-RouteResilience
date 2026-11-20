@@ -23,13 +23,14 @@ import {
 } from 'lucide-react';
 
 // --- DEMO DATA (Simulation mode) ---
-// mIoU / Dice are the REAL best-validation numbers of the DeepGlobe fine-tune
-// (epoch 3, held-out 10% split; mIoU = mean of road & background IoU).
+// mIoU / Dice are the REAL held-out results of the DeepGlobe fine-tune
+// (training/checkpoints/metrics.json: 622 val tiles, best epoch 14; mIoU = mean of road &
+// background IoU; road IoU = 0.535).
 // Everything else in Simulation mode (graph, nodes, healing log) is illustrative demo data.
 const METRICS = {
-  mIoU: 0.712,
+  mIoU: 0.753,
   occlusionRecall: null,   // not measured (no occlusion-labelled test set)
-  dice: 0.629,
+  dice: 0.697,
   relaxedIoU: null,        // not measured
   connectivityBefore: 0.45,
   connectivityAfter: 0.78,
@@ -1048,13 +1049,19 @@ export default function App() {
             </div>
             
             <div className="select-none">
-              {isBeforeHealing ? (
+              {dataSource === 'live_model' && liveData ? (
+                // Real numbers from the live analysis: connected components before / after healing
+                <div className={`${isBeforeHealing ? 'bg-rose-950/20 border-rose-900/40 text-[var(--accent-red)]' : 'bg-emerald-950/20 border-emerald-900/40 text-[var(--accent-green)]'} border font-semibold py-2 rounded-[4px] text-xs text-center font-outfit uppercase`}>
+                  Components: {isBeforeHealing ? liveData.metrics?.components?.extracted : liveData.metrics?.components?.healed}
+                  {!isBeforeHealing && ` (from ${liveData.metrics?.components?.extracted})`}
+                </div>
+              ) : dataSource !== 'simulation' ? null : isBeforeHealing ? (
                 <div className="bg-rose-950/20 border border-rose-900/40 text-[var(--accent-red)] font-semibold py-2 rounded-[4px] text-xs text-center font-outfit uppercase">
-                  Connectivity: 0.45 (Baseline)
+                  Connectivity: 0.45 (Baseline · demo)
                 </div>
               ) : (
                 <div className="bg-emerald-950/20 border border-emerald-900/40 text-[var(--accent-green)] font-semibold py-2 rounded-[4px] text-xs text-center font-outfit uppercase">
-                  Connectivity: {(0.45 + 0.33 * animationProgress).toFixed(2)} (+{Math.round(73 * animationProgress)}%)
+                  Connectivity: {(0.45 + 0.33 * animationProgress).toFixed(2)} (+{Math.round(73 * animationProgress)}% · demo)
                 </div>
               )}
             </div>
@@ -1419,7 +1426,7 @@ export default function App() {
                       : 'Upload a ground-truth mask with the tile to measure segmentation quality.')
                   : dataSource === 'osm'
                   ? 'Real-OSM mode analyses the road network only — no imagery, so no segmentation metrics.'
-                  : 'mIoU / Dice: best validation epoch of the DeepGlobe fine-tune (held-out 10% split). Map layers in Simulation mode are illustrative demo data.'}
+                  : 'mIoU / Dice: held-out DeepGlobe validation (622 tiles); road IoU alone is 0.535. Map layers in Simulation mode are illustrative demo data.'}
               </span>
 
               {/* Loss Architecture Section */}

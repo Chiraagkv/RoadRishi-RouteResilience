@@ -146,9 +146,10 @@ def run_pipeline(
         # fine-tune (they do not describe this synthetic scene). Unmeasured metrics are None.
         "simulated": True,
         "metrics": {
-            "mIoU": 0.712,
-            "dice_score": 0.629,
-            "metrics_source": "best validation epoch of the DeepGlobe fine-tune (not this scene)",
+            "mIoU": 0.753,
+            "road_iou": 0.535,
+            "dice_score": 0.697,
+            "metrics_source": "held-out DeepGlobe validation of the trained model, metrics.json (not this scene)",
             "occlusion_recall": None,
             "relaxed_iou": None,
             "RI_estimate": resilience_estimate,
