@@ -4,6 +4,7 @@ numpy>=1.24.0
 Pillow>=10.0.0
 networkx>=3.0
 scipy>=1.11.0
+scikit-image>=0.22  # mask → road-graph skeletonisation (mask_to_graph.py)
 python-multipart>=0.0.9
 
 # Optional — enables live SegFormer inference (large download)
@@ -11,5 +12,7 @@ python-multipart>=0.0.9
 # transformers>=4.38.0
 
 # Optional — enables real OSM graph loading
-# osmnx>=1.9.0
+# osmnx>=2.0     (graph_from_bbox uses the 2.x bbox signature)
 # geopandas>=0.14.0
+
+# Tests (tests/):  pytest  httpx

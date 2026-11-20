@@ -159,7 +159,10 @@ class GraphHealingEngine:
     def calculate_path_integral(self, pos_i, pos_j, prob_map):
         """
         Computes the path integral of (1 - P_road) along the line between i and j.
+        Returns 0 when no probability map is available (e.g. pure OSM graphs).
         """
+        if prob_map is None:
+            return 0.0
         y1, x1 = pos_i
         y2, x2 = pos_j
         
@@ -177,17 +180,27 @@ class GraphHealingEngine:
             
         return integral / num_samples
 
-    def heal_graph(self, disrupted_G, pos_dict, prob_map, attention_priors):
+    def heal_graph(self, disrupted_G, pos_dict, prob_map, attention_priors, candidate_nodes=None,
+                   close_loops=False, min_detour_ratio=3.0):
         """
         Graph-Healing using Union-Find & MST routing.
-        Finds dangling nodes (degree == 1) and reconnects them based on:
+        Finds dangling nodes (degree == 1) — or uses `candidate_nodes` if given — and
+        reconnects them based on:
         C(e_ij) = w1 * dist + w2 * alignment_penalty + w3 * path_integral + w4 * (1 - pe)
+
+        Edge-existence probability pe of a healed edge:
+          * 0.85 if both ends lie in an attention prior (known occlusion zone)
+          * otherwise, when a probability map is given, an evidence score: mean road
+            probability along the gap, discounted by misalignment (heuristic, not calibrated)
+          * otherwise 0.15 (no evidence either way)
         """
         healed_G = disrupted_G.copy()
-        
-        # Identify dangling nodes (degree == 1)
-        dangling_nodes = [node for node, deg in healed_G.degree() if deg == 1]
-        
+
+        if candidate_nodes is None:
+            dangling_nodes = [node for node, deg in healed_G.degree() if deg == 1]
+        else:
+            dangling_nodes = [n for n in candidate_nodes if n in healed_G]
+
         if len(dangling_nodes) < 2:
             return healed_G, []
 
@@ -232,7 +245,10 @@ class GraphHealingEngine:
                         # High calibrated edge existence probability
                         pe = 0.85
                         break
-                        
+                if pe == 0.0 and prob_map is not None:
+                    evidence = (1.0 - integral) * (1.0 - 0.5 * min(alignment, 1.0))
+                    pe = float(np.clip(evidence, 0.05, 0.95))
+
                 # Compute composite cost
                 cost = (self.w1 * dist + 
                         self.w2 * alignment + 
@@ -262,25 +278,96 @@ class GraphHealingEngine:
                 uf.union(first, node)
 
         healed_edges = []
+        used = set()
+
+        def accept(cand):
+            u, v = cand["u"], cand["v"]
+            healed_G.add_edge(u, v, weight=cand["length"], healed=True, pe=cand["pe"])
+            used.update((u, v))
+            healed_edges.append({
+                "edge_id": f"healed_{u}_{v}",
+                "u": u,
+                "v": v,
+                "u_pos": pos_dict[u],
+                "v_pos": pos_dict[v],
+                "length": float(round(cand["length"], 1)),
+                "pe": float(round(cand["pe"], 2)),
+                "cost": float(round(cand["cost"], 2))
+            })
+
+        # Phase 1 — Kruskal: connect only if it bridges different components (MST principle)
         for cand in candidates:
-            u = cand["u"]
-            v = cand["v"]
-            
-            # Connect only if it bridges different components (MST principle)
-            if uf.union(u, v):
-                healed_G.add_edge(u, v, weight=cand["length"], healed=True, pe=cand["pe"])
-                healed_edges.append({
-                    "edge_id": f"healed_{u}_{v}",
-                    "u": u,
-                    "v": v,
-                    "u_pos": pos_dict[u],
-                    "v_pos": pos_dict[v],
-                    "length": float(round(cand["length"], 1)),
-                    "pe": float(round(cand["pe"], 2)),
-                    "cost": float(round(cand["cost"], 2))
-                })
+            if uf.union(cand["u"], cand["v"]):
+                accept(cand)
+
+        # Phase 2 (optional) — close gaps INSIDE a component. A road broken by an occlusion
+        # in a city grid usually leaves both ends in the same component (the grid routes
+        # around it), so pure MST never repairs it. Accept such a link only if the network
+        # detour between its ends is ≥ min_detour_ratio × the gap, each end used once.
+        if close_loops:
+            for cand in candidates:
+                u, v = cand["u"], cand["v"]
+                if u in used or v in used or healed_G.has_edge(u, v):
+                    continue
+                try:
+                    detour = nx.shortest_path_length(healed_G, u, v, weight="weight")
+                except nx.NetworkXNoPath:
+                    continue
+                if detour >= min_detour_ratio * max(cand["length"], 1e-6):
+                    accept(cand)
 
         return healed_G, healed_edges
+
+
+def plan_repairs(original_G, disrupted_G, pos_dict, repair_pe=0.7, weight="weight"):
+    """
+    Minimum-length repair plan for a disrupted road network (Kruskal over damaged roads).
+
+    Candidates are the edges present in `original_G` but missing from `disrupted_G`
+    (roads destroyed/blocked by the disaster). Sorted by length, an edge is restored only
+    if it joins two different connected components (Union-Find), so the result is the
+    minimum total repair length that maximally reconnects the network — i.e. a minimum
+    spanning forest over the components using only real roads.
+
+    Intersections that merely became isolated (and were dropped from `disrupted_G`) are
+    restored as repair candidates; nodes listed in disrupted_G.graph["destroyed_nodes"]
+    (e.g. "node" disruption mode) are gone and cannot be repaired.
+    Restored edges are marked healed=True with existence probability `repair_pe`
+    (the chance the repair is actually in place), which the Monte Carlo engine samples.
+
+    Returns (healed_G, repairs) with the same repair-record schema as heal_graph().
+    """
+    healed_G = disrupted_G.copy()
+    destroyed = set(disrupted_G.graph.get("destroyed_nodes", []))
+    for n, d in original_G.nodes(data=True):
+        if n not in healed_G and n not in destroyed:
+            healed_G.add_node(n, **d)
+    nodes = set(healed_G.nodes())
+    damaged = [(d.get(weight, 1.0), u, v) for u, v, d in original_G.edges(data=True)
+               if u in nodes and v in nodes and not disrupted_G.has_edge(u, v)]
+    damaged.sort(key=lambda t: t[0])
+
+    uf = UnionFind(healed_G.nodes())
+    for comp in nx.connected_components(healed_G):
+        comp = list(comp)
+        for n in comp[1:]:
+            uf.union(comp[0], n)
+
+    repairs = []
+    for length, u, v in damaged:
+        if uf.union(u, v):
+            healed_G.add_edge(u, v, **{weight: length}, healed=True, pe=repair_pe)
+            repairs.append({
+                "edge_id": f"repair_{u}_{v}",
+                "u": u, "v": v,
+                "u_pos": pos_dict.get(u), "v_pos": pos_dict.get(v),
+                "length": float(round(length, 1)),
+                "pe": float(round(repair_pe, 2)),
+                "cost": float(round(length, 2)),
+            })
+    # Restored intersections that no repair reached stay out (as in disrupted_G)
+    healed_G.remove_nodes_from([n for n in list(nx.isolates(healed_G)) if n not in disrupted_G])
+    return healed_G, repairs
 
 
 def clip(val, min_val, max_val):

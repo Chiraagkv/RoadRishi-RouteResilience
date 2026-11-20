@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { MapContainer, TileLayer, Polyline, Polygon, CircleMarker, Popup, useMap } from 'react-leaflet';
 import { BarChart, Bar, XAxis, Tooltip, ResponsiveContainer, ReferenceLine } from 'recharts';
 import {
@@ -22,15 +22,18 @@ import {
   Database
 } from 'lucide-react';
 
-// --- MOCK DATA ---
+// --- DEMO DATA (Simulation mode) ---
+// mIoU / Dice are the REAL best-validation numbers of the DeepGlobe fine-tune
+// (epoch 3, held-out 10% split; mIoU = mean of road & background IoU).
+// Everything else in Simulation mode (graph, nodes, healing log) is illustrative demo data.
 const METRICS = {
-  mIoU: 0.783,
-  occlusionRecall: 0.691,
-  dice: 0.821,
-  relaxedIoU: 0.847,
+  mIoU: 0.712,
+  occlusionRecall: null,   // not measured (no occlusion-labelled test set)
+  dice: 0.629,
+  relaxedIoU: null,        // not measured
   connectivityBefore: 0.45,
   connectivityAfter: 0.78,
-  apls: 91.3,
+  apls: null,              // not computed (needs ground-truth road graphs)
   resilienceIndex: 0.74,
   lccRatio: 0.79,
   fiedler: 0.68
@@ -128,9 +131,8 @@ const PIPELINE_STEPS = [
 const ALERTS = [
   { id: 1, level: "critical", title: "Critical Node Detected", time: "2m ago", desc: "Node 0312 — high BC + high σBC, re-tasking flagged" },
   { id: 2, level: "warning", title: "Connectivity Gap Found", time: "5m ago", desc: "Edge e_0198 rejected (pₑ = 0.34 < threshold 0.40)" },
-  { id: 3, level: "info", title: "Calibration Complete", time: "8m ago", desc: "Temperature T* = 1.24 · val NLL improved by 12.3%" },
   { id: 4, level: "info", title: "Graph Healed", time: "12m ago", desc: "Connectivity ratio 0.45 → 0.78 · +73% improvement" },
-  { id: 5, level: "warning", title: "Occlusion Detected", time: "15m ago", desc: "Canopy mask 22,117px · λ = 2.0 hidden BCE applied" }
+  { id: 5, level: "warning", title: "Occlusion Detected", time: "15m ago", desc: "Canopy gap detected · candidate healing edge queued" }
 ];
 
 // Helper to determine node risk color and label
@@ -212,6 +214,22 @@ function CustomSlider({ label, min, max, step, value, onChange, theme = 'blue' }
   );
 }
 
+// Shortest vs risk-adjusted route comparison (from the backend's routing.plan_routes)
+function RouteSummary({ routes, unit = 'm' }) {
+  if (!routes) return null;
+  const s = routes.shortest, r = routes.risk_adjusted;
+  if (!s) return <div className="mt-1.5 text-[10px] text-red-400">No route: origin and destination are disconnected.</div>;
+  const fmtLen = (v) => unit === 'm' && v >= 1000 ? `${(v / 1000).toFixed(2)} km` : `${Math.round(v)} ${unit}`;
+  return (
+    <div className="mt-2 pt-2 border-t border-slate-700/50 space-y-1">
+      <div className="text-[10px] uppercase tracking-wider text-slate-400 font-semibold">Routing (λ = {routes.risk_aversion})</div>
+      <div className="flex justify-between"><span className="text-slate-300">⋯ Shortest</span><span className="text-white">{fmtLen(s.length)} · R={s.reliability.toFixed(3)}</span></div>
+      {r && <div className="flex justify-between"><span className="text-orange-400">— Risk-adjusted</span><span className="text-white">{fmtLen(r.length)} · R={r.reliability.toFixed(3)}</span></div>}
+      {r && <div className="text-[10px] text-slate-400">Detour +{routes.detour_pct}% for +{(routes.reliability_gain * 100).toFixed(1)} pts reliability</div>}
+    </div>
+  );
+}
+
 const API_BASE = 'http://localhost:8000';
 
 export default function App() {
@@ -231,6 +249,17 @@ export default function App() {
   const [liveError, setLiveError] = useState(null);
   const [selectedFile, setSelectedFile] = useState(null);
   const [checkpointMode, setCheckpointMode] = useState('simulation'); // 'simulation' | 'live_model'
+  // Risk-adjusted routing / Monte Carlo controls
+  const [riskAversion, setRiskAversion] = useState(1.0);   // λ: 0 = plain shortest path
+  const [hazard, setHazard] = useState(0.05);              // per-road failure probability
+  const [routeOrigin, setRouteOrigin] = useState(null);    // OSM node id (null = auto)
+  const [routeDest, setRouteDest] = useState(null);
+  const [gtMaskFile, setGtMaskFile] = useState(null);      // optional ground-truth mask
+  const [tileBounds, setTileBounds] = useState({ south: '', west: '', north: '', east: '' });
+  const lastOsmCity = useRef(null);   // city of the last loaded OSM graph
+  // Map view — must be declared before pixelToMapPosition / liveNodes use it during render
+  const [mapCenter, setMapCenter] = useState([12.9716, 77.5946]);
+  const [mapZoom, setMapZoom] = useState(15);
 
   // OSM city configs for map centering
   const CITY_CENTERS = {
@@ -258,16 +287,26 @@ export default function App() {
       disruption_pct: disruptionPct.toFixed(2),
       disruption_mode: disruptionMode,
       mc_samples: 15,
+      risk_aversion: riskAversion.toFixed(2),
+      hazard: hazard.toFixed(3),
     });
+    if (routeOrigin && routeDest) {
+      params.set('origin_id', routeOrigin);
+      params.set('dest_id', routeDest);
+    }
     fetch(`${API_BASE}/api/osm-pipeline?${params}`)
       .then(r => r.json())
       .then(data => {
+        const recenter = lastOsmCity.current !== osmCity;
+        lastOsmCity.current = osmCity;
         setOsmData(data);
         setOsmLoading(false);
-        // Re-center map on selected city
-        setMapCenter(CITY_CENTERS[osmCity] || [12.9716, 77.5946]);
-        setMapZoom(13);
-        setToastMessage(`OSM graph loaded — ${data.meta?.original_nodes ?? '?'} nodes, ${data.meta?.original_edges ?? '?'} edges`);
+        // Re-center map only when the city changes (keeps the view while tuning routes)
+        if (recenter) {
+          setMapCenter(CITY_CENTERS[osmCity] || [12.9716, 77.5946]);
+          setMapZoom(14);
+        }
+        setToastMessage(`${data.meta?.using_real_osm ? 'OSM graph' : 'Synthetic grid (OSM unreachable)'} loaded — ${data.meta?.original_nodes ?? '?'} nodes, ${data.meta?.repaired_edges ?? 0} repairs planned`);
         setShowToast(true);
         setTimeout(() => setShowToast(false), 4000);
       })
@@ -275,7 +314,16 @@ export default function App() {
         setOsmError('Backend not reachable — start the FastAPI server.');
         setOsmLoading(false);
       });
-  }, [osmCity, disruptionPct, disruptionMode]);
+  }, [osmCity, disruptionPct, disruptionMode, riskAversion, hazard, routeOrigin, routeDest]);
+
+  // Once a graph is loaded, re-plan automatically when routing inputs change (debounced)
+  useEffect(() => {
+    if (dataSource !== 'osm' || !lastOsmCity.current) return;
+    if ((routeOrigin && !routeDest) || (!routeOrigin && routeDest)) return;  // wait for both ends
+    const t = setTimeout(fetchOSMData, 400);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [riskAversion, hazard, routeOrigin, routeDest]);
 
   const fetchLiveModelData = useCallback(() => {
     if (!selectedFile) {
@@ -286,7 +334,11 @@ export default function App() {
     setLiveError(null);
     const formData = new FormData();
     formData.append('image', selectedFile);
-    fetch(`${API_BASE}/api/segment-live`, {
+    if (gtMaskFile) formData.append('mask', gtMaskFile);
+    const b = tileBounds;
+    const hasBounds = ['south', 'west', 'north', 'east'].every(k => b[k] !== '' && !isNaN(parseFloat(b[k])));
+    if (hasBounds) ['south', 'west', 'north', 'east'].forEach(k => formData.append(k, parseFloat(b[k])));
+    fetch(`${API_BASE}/api/segment-live?risk_aversion=${riskAversion.toFixed(2)}`, {
       method: 'POST',
       body: formData,
     })
@@ -297,7 +349,8 @@ export default function App() {
         }
         setLiveData(data);
         setLiveLoading(false);
-        setMapCenter([12.9716, 77.5946]);
+        const gb = data.geo?.bounds;
+        setMapCenter(gb ? [(gb[0] + gb[2]) / 2, (gb[1] + gb[3]) / 2] : [12.9716, 77.5946]);
         setMapZoom(15);
         setToastMessage(`Live segmentation completed — ${data.metrics?.RI_estimate?.toFixed(3) ?? '?'} RI`);
         setShowToast(true);
@@ -307,11 +360,11 @@ export default function App() {
         setLiveError(err.message || 'Backend not reachable — start the FastAPI server.');
         setLiveLoading(false);
       });
-  }, [selectedFile]);
+  }, [selectedFile, gtMaskFile, tileBounds, riskAversion]);
 
-  // Derived OSM graph layers (edges as polylines)
-  const osmEdges = osmData?.graphs?.disrupted?.edges ?? [];
-  const osmNodes = osmData?.graphs?.disrupted?.nodes ?? [];
+  // Derived OSM graph layers (edges as polylines) — the repaired network; repairs have healed=true
+  const osmEdges = osmData?.graphs?.healed?.edges ?? [];
+  const osmNodes = osmData?.graphs?.healed?.nodes ?? [];
   const osmMetrics = osmData?.metrics ?? null;
 
   const pixelToMapPosition = (pos, sceneSize) => {
@@ -319,10 +372,24 @@ export default function App() {
     const [y, x] = pos;
     const height = sceneSize?.height ?? 1000;
     const width = sceneSize?.width ?? 1000;
-    const lat = mapCenter[0] + ((y / height) - 0.5) * 0.01;
+    const gb = liveData?.geo?.bounds;          // [south, west, north, east] if georeferenced
+    if (gb) {
+      return [gb[2] - (y / height) * (gb[2] - gb[0]), gb[1] + (x / width) * (gb[3] - gb[1])];
+    }
+    // Not georeferenced: place the tile as a ~1 km square around the map centre (illustrative)
+    const lat = mapCenter[0] - ((y / height) - 0.5) * 0.01;
     const lng = mapCenter[1] + ((x / width) - 0.5) * 0.01;
     return [lat, lng];
   };
+
+  // Routes: shortest vs risk-adjusted, in map coordinates
+  const activeRoutes = dataSource === 'osm' ? osmData?.routes
+    : dataSource === 'live_model' ? (liveData?.osm_conflation?.routes ?? liveData?.routes) : null;
+  const routesArePixels = dataSource === 'live_model' && !liveData?.osm_conflation?.routes;
+  const toMap = (c) => routesArePixels ? pixelToMapPosition(c, liveData?.scene) : c;
+  const shortestRoute = (activeRoutes?.shortest?.coords ?? []).map(toMap);
+  const riskRoute = (activeRoutes?.risk_adjusted?.coords ?? []).map(toMap);
+  const conflatedEdges = dataSource === 'live_model' ? (liveData?.osm_conflation?.graph?.edges ?? []) : [];
 
   const liveNodes = (liveData?.graphs?.healed?.nodes ?? []).map(node => ({
     id: node.id,
@@ -367,23 +434,30 @@ export default function App() {
   });
 
   const displayMetrics = dataSource === 'live_model' && liveData ? {
-    mIoU: liveData.metrics?.mIoU ?? 0,
-    occlusionRecall: liveData.metrics?.occlusion_recall ?? 0,
-    dice: liveData.metrics?.dice_score ?? 0,
-    relaxedIoU: liveData.metrics?.relaxed_iou ?? 0,
+    // null = not measured (no ground-truth mask uploaded) → shown as "—", never a made-up value
+    mIoU: liveData.metrics?.mIoU ?? null,
+    occlusionRecall: liveData.metrics?.occlusion_recall ?? null,
+    dice: liveData.metrics?.dice_score ?? null,
+    relaxedIoU: liveData.metrics?.relaxed_iou ?? null,
     connectivityBefore: 0.45,
     connectivityAfter: Math.max(0.0, liveData.metrics?.RI_estimate ?? 0.0),
     apls: liveData.metrics?.apls_score ?? 0,
     resilienceIndex: liveData.metrics?.RI_estimate ?? 0,
     lccRatio: liveData.metrics?.LCC?.healed ?? 0,
     fiedler: liveData.metrics?.Fiedler?.healed ?? 0,
-  } : METRICS;
+  } : dataSource === 'osm'
+    // OSM mode has no imagery → no segmentation metrics (cards show "—")
+    ? { ...METRICS, mIoU: null, occlusionRecall: null, dice: null, relaxedIoU: null }
+    : METRICS;
 
-  const displayNodes = dataSource === 'live_model' && liveData ? liveNodes : NODES;
-  const displayRoadSegments = dataSource === 'live_model' && liveData ? liveRoadSegments : ROAD_SEGMENTS;
-  const displayRoadSegmentsPreHeal = dataSource === 'live_model' && liveData ? liveRoadSegmentsPreHeal : ROAD_SEGMENTS_PRE_HEAL;
-  const displayHealedEdges = dataSource === 'live_model' && liveData ? liveHealedEdges : HEALED_EDGES;
-  const displayOcclusionZones = dataSource === 'live_model' && liveData ? liveOcclusionZones : OCCLUSION_ZONES;
+  // Simulated scene layers only in simulation mode (they used to bleed into OSM / live views)
+  const useLive = dataSource === 'live_model' && liveData;
+  const useSim = dataSource === 'simulation';
+  const displayNodes = useLive ? liveNodes : useSim ? NODES : [];
+  const displayRoadSegments = useLive ? liveRoadSegments : useSim ? ROAD_SEGMENTS : [];
+  const displayRoadSegmentsPreHeal = useLive ? liveRoadSegmentsPreHeal : useSim ? ROAD_SEGMENTS_PRE_HEAL : [];
+  const displayHealedEdges = useLive ? liveHealedEdges : useSim ? HEALED_EDGES : [];
+  const displayOcclusionZones = useLive ? liveOcclusionZones : useSim ? OCCLUSION_ZONES : [];
   
   // Sliders state
   const [confidenceThreshold, setConfidenceThreshold] = useState(0.50);
@@ -393,9 +467,7 @@ export default function App() {
   const [mcSamples, setMcSamples] = useState('100');
   const [isAttentionGuided, setIsAttentionGuided] = useState(true);
 
-  // Map settings based on scene selection
-  const [mapCenter, setMapCenter] = useState([12.9716, 77.5946]);
-  const [mapZoom, setMapZoom] = useState(15);
+  // (mapCenter / mapZoom state is declared near the top: render-time helpers use it)
 
   // Visibility of Map Layers
   const [layersVisibility, setLayersVisibility] = useState({
@@ -677,6 +749,32 @@ export default function App() {
                   theme="blue"
                 />
 
+                {/* Monte Carlo hazard + routing risk aversion */}
+                <CustomSlider
+                  label={`Road Hazard p(fail) (${Math.round(hazard * 100)}%)`}
+                  min={0.0}
+                  max={0.30}
+                  step={0.01}
+                  value={hazard}
+                  onChange={setHazard}
+                  theme="blue"
+                />
+                <CustomSlider
+                  label="Route Risk Aversion λ"
+                  min={0}
+                  max={10}
+                  step={0.5}
+                  value={riskAversion}
+                  onChange={setRiskAversion}
+                  theme="green"
+                />
+                <div className="text-[10px] text-slate-500 leading-snug">
+                  {routeOrigin && routeDest
+                    ? <>Route: <span className="text-slate-300 font-mono">{String(routeOrigin).slice(-6)}</span> → <span className="text-slate-300 font-mono">{String(routeDest).slice(-6)}</span>{' '}
+                        <button className="underline text-blue-400 cursor-pointer" onClick={() => { setRouteOrigin(null); setRouteDest(null); }}>reset</button></>
+                    : 'Click a node on the map to set route origin / destination (default: two far-apart nodes).'}
+                </div>
+
                 {/* Load Graph button */}
                 <button
                   onClick={fetchOSMData}
@@ -694,7 +792,10 @@ export default function App() {
                     <div className="flex justify-between"><span className="text-slate-400">Nodes</span><span className="text-white">{osmData.meta?.original_nodes}</span></div>
                     <div className="flex justify-between"><span className="text-slate-400">Edges (pre)</span><span className="text-white">{osmData.meta?.original_edges}</span></div>
                     <div className="flex justify-between"><span className="text-slate-400">Edges (post)</span><span className="text-red-400">{osmData.meta?.disrupted_edges}</span></div>
-                    <div className="flex justify-between"><span className="text-slate-400">RI</span><span className="text-emerald-400 font-bold">{osmData.metrics?.RI_estimate?.toFixed(3)}</span></div>
+                    <div className="flex justify-between"><span className="text-slate-400">Repairs (MST)</span><span className="text-[#39FF14]">{osmData.meta?.repaired_edges} · {Math.round(osmData.meta?.repair_length_m ?? 0)} m</span></div>
+                    <div className="flex justify-between"><span className="text-slate-400">RI disrupted → repaired</span><span className="text-emerald-400 font-bold">{osmData.metrics?.RI_disrupted?.toFixed(3)} → {osmData.metrics?.RI_estimate?.toFixed(3)}</span></div>
+                    <div className="flex justify-between"><span className="text-slate-400">MC E[LCC] / P(conn)</span><span className="text-white">{osmData.monte_carlo?.expected_lcc_fraction?.toFixed(3)} / {osmData.monte_carlo?.p_fully_connected?.toFixed(2)}</span></div>
+                    <RouteSummary routes={osmData.routes} unit="m" />
                     {osmData.meta?.using_real_osm && (
                       <div className="mt-1.5 text-emerald-400 text-[9px] font-semibold flex items-center gap-1"><Globe size={9} /> Real OSM data</div>
                     )}
@@ -719,6 +820,40 @@ export default function App() {
                     className="w-full text-[12px] text-slate-300 file:mr-3 file:py-2 file:px-3 file:rounded-md file:border-0 file:bg-emerald-900/40 file:text-emerald-300 file:font-semibold"
                   />
                 </div>
+                <div>
+                  <label className="block text-[11px] text-[#64748B] mb-1.5">Ground-truth mask (optional → real IoU)</label>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) => setGtMaskFile(e.target.files?.[0] || null)}
+                    className="w-full text-[12px] text-slate-300 file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border-0 file:bg-slate-800 file:text-slate-300 file:font-semibold"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] text-[#64748B] mb-1.5">Tile bounds (optional → OSM conflation)</label>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {['north', 'south', 'west', 'east'].map(k => (
+                      <input
+                        key={k}
+                        type="number"
+                        step="any"
+                        placeholder={k}
+                        value={tileBounds[k]}
+                        onChange={(e) => setTileBounds(prev => ({ ...prev, [k]: e.target.value }))}
+                        className="w-full bg-[var(--bg-elevated)] border border-[var(--border-bright)] rounded-md text-[12px] text-[#E2E8F0] p-1.5 font-mono"
+                      />
+                    ))}
+                  </div>
+                </div>
+                <CustomSlider
+                  label="Route Risk Aversion λ"
+                  min={0}
+                  max={10}
+                  step={0.5}
+                  value={riskAversion}
+                  onChange={setRiskAversion}
+                  theme="green"
+                />
                 <button
                   onClick={fetchLiveModelData}
                   disabled={liveLoading}
@@ -730,8 +865,16 @@ export default function App() {
                   <div className="bg-emerald-950/20 border border-emerald-900/40 rounded-md p-2.5 text-[11px] space-y-1 font-mono">
                     <div className="text-emerald-300 font-semibold text-[10px] uppercase tracking-wider mb-1.5">Live Result</div>
                     <div className="flex justify-between"><span className="text-slate-400">RI</span><span className="text-white">{liveData.metrics?.RI_estimate?.toFixed(3)}</span></div>
-                    <div className="flex justify-between"><span className="text-slate-400">mIoU</span><span className="text-white">{liveData.metrics?.mIoU?.toFixed(3)}</span></div>
+                    <div className="flex justify-between"><span className="text-slate-400">Road IoU</span><span className="text-white">{liveData.metrics?.road_iou?.toFixed(3) ?? '— (no GT)'}</span></div>
+                    <div className="flex justify-between"><span className="text-slate-400">Components extracted → healed</span><span className="text-white">{liveData.metrics?.components?.extracted} → {liveData.metrics?.components?.healed}</span></div>
                     <div className="flex justify-between"><span className="text-slate-400">Healed edges</span><span className="text-white">{liveData.healed_log?.length ?? 0}</span></div>
+                    {liveData.osm_conflation?.stats && (
+                      <div className="flex justify-between"><span className="text-slate-400">OSM roads seen / scored</span><span className="text-white">{(liveData.osm_conflation.stats.edges_scored - liveData.osm_conflation.stats.edges_unseen)} / {liveData.osm_conflation.stats.edges_scored}</span></div>
+                    )}
+                    {liveData.osm_conflation?.error && (
+                      <div className="text-amber-400 text-[10px]">OSM conflation failed: {liveData.osm_conflation.error}</div>
+                    )}
+                    <RouteSummary routes={liveData.osm_conflation?.routes ?? liveData.routes} unit={liveData.osm_conflation?.routes ? 'm' : 'px'} />
                   </div>
                 )}
                 {liveError && (
@@ -762,13 +905,13 @@ export default function App() {
             <div className="mb-8">
               <label className="block text-[11px] text-[#64748B] mb-1.5">Band Config</label>
               <div className="text-[12px] bg-[var(--bg-elevated)] border border-[var(--border-bright)] rounded-md p-2 text-[var(--text-secondary)] opacity-45 cursor-not-allowed select-none">
-                G / R / NIR / NDVI (4ch)
+                RGB (3ch) · ImageNet-normalised
               </div>
             </div>
 
             <div className="bg-[var(--bg-elevated)] border border-[var(--border)] rounded-md p-2 flex items-center gap-2 text-[11px] text-[var(--text-muted)] font-medium select-none">
               <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full shrink-0" />
-              Resolution: 5.8m · Sensor: LISS-IV MX
+              Trained on DeepGlobe · 0.5 m/px (resized to 384 px)
             </div>
           </div>
 
@@ -806,7 +949,7 @@ export default function App() {
             />
 
             <CustomSlider
-              label="Temperature T (Calibrated)"
+              label="Temperature T (simulation only)"
               min={0.5}
               max={3.0}
               step={0.1}
@@ -816,8 +959,8 @@ export default function App() {
             />
 
             <div className="bg-yellow-950/15 border border-yellow-900/30 rounded-md p-2 px-3 flex items-center justify-between select-none">
-              <span className="text-xs text-[var(--text-secondary)]">λ hidden BCE</span>
-              <span className="text-sm font-bold text-[var(--accent-yellow)] font-mono">2.0</span>
+              <span className="text-xs text-[var(--text-secondary)]">Road-class CE weight</span>
+              <span className="text-sm font-bold text-[var(--accent-yellow)] font-mono">4.0</span>
             </div>
           </div>
 
@@ -1145,11 +1288,43 @@ export default function App() {
                   positions={[edge.u_pos, edge.v_pos]}
                   pathOptions={{
                     color: edge.healed ? '#39FF14' : '#00E5FF',
-                    weight: 1.5,
-                    opacity: 0.7,
+                    weight: edge.healed ? 3 : 1.5,
+                    dashArray: edge.healed ? '6,4' : undefined,
+                    opacity: edge.healed ? 0.95 : 0.6,
                   }}
                 />
               ))}
+
+              {/* Mask ↔ OSM conflation: OSM roads coloured by how strongly the model sees them */}
+              {conflatedEdges.map((edge, i) => (
+                <Polyline
+                  key={`conf-osm-${i}`}
+                  positions={[edge.u_pos, edge.v_pos]}
+                  pathOptions={{
+                    color: edge.support == null ? '#64748B' : edge.support >= 0.6 ? '#22C55E' : edge.support >= 0.3 ? '#EAB308' : '#EF4444',
+                    weight: 2,
+                    opacity: 0.85,
+                  }}
+                >
+                  <Popup>
+                    <div className="text-xs">mask support: {edge.support == null ? 'outside tile' : edge.support.toFixed(2)}<br />p<sub>e</sub>: {edge.pe ?? 1}</div>
+                  </Popup>
+                </Polyline>
+              ))}
+
+              {/* Routes: shortest (white, dotted) vs risk-adjusted (orange) */}
+              {shortestRoute.length > 1 && (
+                <Polyline positions={shortestRoute} pathOptions={{ color: '#FFFFFF', weight: 4, dashArray: '2,8', opacity: 0.9 }} />
+              )}
+              {riskRoute.length > 1 && (
+                <Polyline positions={riskRoute} pathOptions={{ color: '#F97316', weight: 5, opacity: 0.85 }} />
+              )}
+              {shortestRoute.length > 1 && (
+                <>
+                  <CircleMarker center={shortestRoute[0]} radius={8} pathOptions={{ color: '#FFFFFF', fillColor: '#2563EB', fillOpacity: 1, weight: 2 }} />
+                  <CircleMarker center={shortestRoute[shortestRoute.length - 1]} radius={8} pathOptions={{ color: '#FFFFFF', fillColor: '#DC2626', fillOpacity: 1, weight: 2 }} />
+                </>
+              )}
 
               {/* OSM Graph nodes overlay */}
               {dataSource === 'osm' && osmNodes.map((node, i) => {
@@ -1167,6 +1342,10 @@ export default function App() {
                         <div className="font-bold mb-1">Node {node.id?.toString().slice(-6)}</div>
                         <div>BC: {node.meanBC?.toFixed(3)} | σ: {node.stdBC?.toFixed(3)}</div>
                         <div className="font-bold mt-1" style={{ color }}>{q}</div>
+                        <div className="flex gap-1 mt-1.5">
+                          <button className="px-1.5 py-0.5 rounded bg-blue-600 text-white text-[10px] cursor-pointer" onClick={() => setRouteOrigin(node.id)}>Set origin</button>
+                          <button className="px-1.5 py-0.5 rounded bg-red-600 text-white text-[10px] cursor-pointer" onClick={() => setRouteDest(node.id)}>Set destination</button>
+                        </div>
                       </div>
                     </Popup>
                   </CircleMarker>
@@ -1183,7 +1362,7 @@ export default function App() {
           {/* Info bar coordinates (bottom of map) */}
           <div className="h-[32px] bg-[var(--bg-base)] border-t border-[var(--border)] px-4 flex items-center justify-between text-[11px] font-mono text-slate-300 select-none">
             <div>
-              LISS-IV • 5km&times;5km tile • CRS: WGS84 • {hoverCoords ? `${hoverCoords[0].toFixed(4)}°N ${hoverCoords[1].toFixed(4)}°E` : '12.9731°N 77.5951°E'} | NDVI: ~{currentHoverMetrics.ndvi} | Conf: ~{currentHoverMetrics.conf} • Last processed: just now
+              Basemap: Esri World Imagery • CRS: WGS84 • {hoverCoords ? `${hoverCoords[0].toFixed(4)}°N ${hoverCoords[1].toFixed(4)}°E` : '12.9731°N 77.5951°E'}{dataSource === 'simulation' ? ' • Simulation mode: illustrative demo scene' : ''}
             </div>
             <div>
               Tiles &copy; Esri &mdash; Source: Esri, Maxar
@@ -1217,13 +1396,13 @@ export default function App() {
                     
                     <div className="flex flex-col items-center select-none mb-1">
                       <span className="text-[10px] text-[var(--text-secondary)] uppercase font-semibold tracking-wider mb-1">{card.label}</span>
-                      <span className="text-[8px] font-bold tracking-wider px-1.5 py-0.5 rounded-[3px] bg-slate-900/60 uppercase" style={{ color: card.target && card.isMet !== false ? 'var(--accent-green)' : 'var(--accent-yellow)' }}>
-                        {card.target && card.isMet !== false ? 'Target Met' : 'Projected'}
+                      <span className="text-[8px] font-bold tracking-wider px-1.5 py-0.5 rounded-[3px] bg-slate-900/60 uppercase" style={{ color: card.val == null ? 'var(--text-muted)' : card.target && card.isMet !== false ? 'var(--accent-green)' : 'var(--accent-yellow)' }}>
+                        {card.val == null ? 'Not measured' : dataSource === 'simulation' ? 'Validation' : card.target && card.isMet !== false ? 'Target Met' : 'Measured'}
                       </span>
                     </div>
 
                     <div className="text-3xl font-bold font-mono text-white select-none my-1">
-                      {(card.val * animationProgress).toFixed(3)}
+                      {card.val == null ? '—' : (card.val * animationProgress).toFixed(3)}
                     </div>
 
                     {card.target && (
@@ -1234,22 +1413,27 @@ export default function App() {
               </div>
 
               <span className="text-[10px] text-slate-400 font-medium leading-relaxed mt-1 block select-none">
-                Projected performance on Bengaluru 5km² tile based on SegFormer MiT-B3 benchmarks on comparable datasets.
+                {dataSource === 'live_model'
+                  ? (liveData?.metrics?.metrics_source === 'ground-truth mask'
+                      ? 'Measured against the uploaded ground-truth mask.'
+                      : 'Upload a ground-truth mask with the tile to measure segmentation quality.')
+                  : dataSource === 'osm'
+                  ? 'Real-OSM mode analyses the road network only — no imagery, so no segmentation metrics.'
+                  : 'mIoU / Dice: best validation epoch of the DeepGlobe fine-tune (held-out 10% split). Map layers in Simulation mode are illustrative demo data.'}
               </span>
 
               {/* Loss Architecture Section */}
               <div className="mt-4 border-t border-[var(--border)] pt-5 select-none">
                 <div className="flex items-center gap-2 mb-3">
                   <div className="w-[3px] h-[14px] bg-[var(--accent-purple)] rounded-sm" />
-                  <span className="text-[10px] font-bold tracking-widest text-slate-400 uppercase">Loss Architecture (Design Weights)</span>
+                  <span className="text-[10px] font-bold tracking-widest text-slate-400 uppercase">Training Loss</span>
                 </div>
-                <p className="text-[10px] text-slate-400 mb-3 italic">Design parameters — not live training output</p>
+                <p className="text-[10px] text-slate-400 mb-3 italic">L = CrossEntropy(class weights bg 1 : road 4) + Dice(road) — combined 1 : 1</p>
                 
                 <div className="space-y-3.5">
                   {[
-                    { label: 'L_BCE', weight: '11.4%', width: '11.4%', color: 'var(--accent-blue)' },
-                    { label: 'L_clDice', weight: '~0.85 est.', width: '85.0%', color: 'var(--accent-purple)' },
-                    { label: 'L_BCE_Hdn', weight: '5.7%', width: '5.7%', color: 'var(--accent-yellow)' }
+                    { label: 'L_CE', weight: '× 1.0', width: '50%', color: 'var(--accent-blue)' },
+                    { label: 'L_Dice', weight: '× 1.0', width: '50%', color: 'var(--accent-purple)' }
                   ].map(row => (
                     <div key={row.label} className="flex items-center gap-3 py-1 text-xs">
                       <span className="w-16 font-mono text-[var(--text-secondary)]">{row.label}</span>
@@ -1268,9 +1452,8 @@ export default function App() {
                 </div>
 
                 <div className="flex gap-4 mt-4 text-[11px] text-[var(--text-secondary)] font-medium">
-                  <div className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-[var(--accent-blue)]" /> BCE</div>
-                  <div className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-[var(--accent-purple)]" /> clDice</div>
-                  <div className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-[var(--accent-yellow)]" /> Hidden</div>
+                  <div className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-[var(--accent-blue)]" /> Weighted CE</div>
+                  <div className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-[var(--accent-purple)]" /> Dice</div>
                 </div>
               </div>
 
@@ -1278,7 +1461,7 @@ export default function App() {
               <div className="mt-5 border-t border-[var(--border)] pt-5 select-none flex-grow flex flex-col min-h-[240px]">
                 <div className="flex items-center gap-2 mb-3">
                   <div className="w-[3px] h-[14px] bg-[var(--accent-green)] rounded-sm" />
-                  <span className="text-[10px] font-bold tracking-widest text-slate-400 uppercase">NDVI Channel Distribution</span>
+                  <span className="text-[10px] font-bold tracking-widest text-slate-400 uppercase">NDVI Distribution (illustrative — the model is RGB-only)</span>
                 </div>
                 
                 <div className="flex gap-4 mb-2 text-[10px] text-[var(--text-secondary)] font-medium">
@@ -1306,6 +1489,9 @@ export default function App() {
           {/* TAB 2: GRAPH ANALYSIS */}
           {activeTab === 'Graph Analysis' && (
             <>
+              <div className="text-[10px] text-amber-400/90 bg-amber-950/20 border border-amber-900/40 rounded-md px-2.5 py-1.5 mb-3 select-none">
+                Illustrative demo data — this tab is not yet wired to live / OSM results. Real per-node risk is shown on the map (node colours and popups).
+              </div>
               {/* Connectivity Ratio Hero Card */}
               <div className="glass-card border border-[var(--border)] rounded-lg p-4 select-none">
                 <span className="text-[11px] text-[var(--text-muted)] uppercase font-bold tracking-wider block mb-3">Connectivity Ratio</span>
@@ -1367,10 +1553,9 @@ export default function App() {
               <div className="glass-card border border-[var(--border)] rounded-lg p-5 relative overflow-hidden flex flex-col items-center justify-center text-center select-none min-h-[110px]">
                 <div className="absolute top-0 left-0 right-0 h-[3px] bg-[var(--accent-green)]" />
                 <span className="text-[11px] text-slate-400 font-semibold uppercase tracking-wider mb-1">APLS Score</span>
-                <span className="text-3xl font-bold font-mono text-[var(--accent-green)] my-0.5">91.3%</span>
+                <span className="text-3xl font-bold font-mono text-slate-500 my-0.5">—</span>
                 <div className="flex flex-col items-center mt-1">
-                  <span className="text-[12px] font-semibold text-[var(--accent-green)]">8.7% avg path error</span>
-                  <span className="text-[11px] text-slate-400 font-semibold mt-0.5">Target &le; 12% • ✓ Met</span>
+                  <span className="text-[11px] text-slate-400 font-semibold mt-0.5">Not computed — needs ground-truth road graphs</span>
                 </div>
               </div>
 
@@ -1414,6 +1599,9 @@ export default function App() {
           {/* TAB 3: RESILIENCE */}
           {activeTab === 'Resilience' && (
             <>
+              <div className="text-[10px] text-amber-400/90 bg-amber-950/20 border border-amber-900/40 rounded-md px-2.5 py-1.5 mb-3 select-none">
+                Illustrative demo data — this tab is not yet wired to live / OSM results. Real per-node risk is shown on the map (node colours and popups).
+              </div>
               {/* RI Gauge */}
               <div className="glass-card border border-[var(--border)] rounded-lg p-4 text-center select-none">
                 <span className="text-[11px] text-[var(--text-muted)] uppercase font-bold tracking-wider block text-left mb-2">Resilience Index (RI)</span>

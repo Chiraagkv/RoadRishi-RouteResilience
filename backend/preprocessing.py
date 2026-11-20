@@ -5,8 +5,9 @@ from PIL import Image
 class PreprocessPipeline:
     """
     RoadRishi Ingestion & Preprocessing Pipeline.
-    Simulates dual Sentinel-2 / LISS-IV bands parsing, performs NDVI synthesis,
-    normalizes features, and extracts overlapping 512x512 tile matrices.
+    DEMO ONLY: synthesises a pseudo-NIR band and NDVI from an RGB image (no real
+    multispectral data is read; the SegFormer model itself uses plain RGB). Also
+    normalises the bands and extracts overlapping tiles. Not used by the live inference path.
     """
     def __init__(self, tile_size=512, stride=128):
         self.tile_size = tile_size

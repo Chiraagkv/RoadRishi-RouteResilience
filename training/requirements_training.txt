@@ -7,3 +7,4 @@ scikit-learn
 tqdm
 Pillow
 numpy>=1.24
+matplotlib   # curves.png / predictions_grid.png

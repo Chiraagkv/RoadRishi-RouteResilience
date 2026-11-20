@@ -99,46 +99,72 @@ class CriticalityVarianceEngine:
             "connectivity_gain": float(round((ri_healed - ri_disrupted) * 100, 1))
         }
 
-    def run_monte_carlo(self, G, healed_edges):
+    def edge_pe(self, data, healed_lookup=None, u=None, v=None, default_pe=1.0):
+        """Existence probability of an edge: explicit 'pe' attr > healed lookup > default."""
+        if "pe" in data and data["pe"] is not None:
+            return float(data["pe"])
+        if data.get("healed", False):
+            return (healed_lookup or {}).get((u, v), 0.5)
+        return default_pe
+
+    def run_monte_carlo(self, G, healed_edges=None, default_pe=1.0, bc_exact_max_nodes=400,
+                        bc_k=100, seed=None):
         """
-        Runs Monte Carlo edge-sampling trials.
-        For each healed edge, we draw a Bernoulli random variable using its probability pe.
-        Original edges are assumed to be 100% reliable.
-        Computes Betweenness Centrality mean and standard deviation for each node.
+        Monte Carlo edge-drop simulation.
+        In every trial each edge survives with its existence probability pe (Bernoulli):
+          * edges with a 'pe' attribute use it (healed gaps, repairs, mask-conflated OSM edges)
+          * healed edges without one use the pe in `healed_edges` (0.5 if missing)
+          * all other edges use `default_pe` (1.0 = perfectly reliable; set <1 for a hazard rate)
+        Computes Betweenness Centrality mean / std per node over the trials. For graphs larger
+        than `bc_exact_max_nodes`, BC is approximated from `bc_k` sampled source nodes.
+
+        Also stores self.last_summary with the expected fraction of nodes in the largest
+        connected component and the probability that the whole graph stays connected.
         """
-        # Create a fast lookup for healed edges and their probabilities
+        rng = np.random.default_rng(seed)
         healed_lookup = {}
-        for edge in healed_edges:
+        for edge in healed_edges or []:
             u, v = edge["u"], edge["v"]
             healed_lookup[(u, v)] = edge["pe"]
             healed_lookup[(v, u)] = edge["pe"]
 
         nodes = list(G.nodes())
         bc_history = {node: [] for node in G.nodes()}
+        edge_list = list(G.edges(data=True))
+        pes = np.array([self.edge_pe(d, healed_lookup, u, v, default_pe) for u, v, d in edge_list])
+        uncertain = np.nonzero(pes < 1.0)[0]
+        approx = len(nodes) > bc_exact_max_nodes
+        lcc_fracs, connected = [], []
 
-        for _ in range(self.num_samples):
-            # Sample graph instance
+        for t in range(self.num_samples):
             sample_G = G.copy()
-            edges_to_remove = []
-            
-            # Draw Bernoulli trials for healed edges
-            for u, v, data in G.edges(data=True):
-                if data.get("healed", False):
-                    pe = healed_lookup.get((u, v), 0.5)
-                    # Bernoulli test
-                    if np.random.rand() > pe:
-                        edges_to_remove.append((u, v))
-                        
-            sample_G.remove_edges_from(edges_to_remove)
-            
-            # Compute Betweenness Centrality
+            draws = rng.random(len(uncertain))
+            drop = uncertain[draws > pes[uncertain]]
+            sample_G.remove_edges_from((edge_list[i][0], edge_list[i][1]) for i in drop)
+
             try:
-                bc = nx.betweenness_centrality(sample_G, weight='weight')
+                if approx:
+                    bc = nx.betweenness_centrality(sample_G, k=min(bc_k, len(nodes)),
+                                                   weight='weight', seed=int(rng.integers(2**31)))
+                else:
+                    bc = nx.betweenness_centrality(sample_G, weight='weight')
             except Exception:
                 bc = {node: 0.0 for node in nodes}
-                
+
             for node in nodes:
                 bc_history[node].append(bc.get(node, 0.0))
+            if len(sample_G):
+                comps = list(nx.connected_components(sample_G))
+                lcc_fracs.append(max(len(c) for c in comps) / len(sample_G))
+                connected.append(len(comps) == 1)
+
+        self.last_summary = {
+            "samples": self.num_samples,
+            "uncertain_edges": int(len(uncertain)),
+            "expected_lcc_fraction": float(round(np.mean(lcc_fracs), 4)) if lcc_fracs else 0.0,
+            "p_fully_connected": float(round(np.mean(connected), 4)) if connected else 0.0,
+            "bc_approximate": bool(approx),
+        }
 
         # Compute summary statistics
         node_stats = {}

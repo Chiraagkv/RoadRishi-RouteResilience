@@ -1,130 +1,94 @@
-# RoadRishi — 15-Minute Hackathon Demo Script
+# RoadRishi — Demo Script (~10 minutes)
 
-> **Audience:** Judges with ML/geospatial background  
-> **Goal:** Show the full pipeline end-to-end — preprocessing → segmentation → graph healing → resilience  
-> **Setup:** Backend running (`python main.py`), frontend open (`npm run dev`), Kaggle tab open
+> **Audience:** reviewers with an ML / geospatial background
+> **Goal:** show the pipeline end-to-end: segmentation → road graph → healing → resilience → routing
+> **Rule:** every number you quote must come from the screen or from `training/checkpoints/metrics.json`.
 
 ---
 
-## Before You Start (5 min before judges arrive)
+## Before you start
 
 ```
-✅ Terminal 1: python backend/main.py        → "Starting RoadRishi server..."
-✅ Terminal 2: cd frontend && npm run dev    → Vite on http://localhost:5173
-✅ Browser:    http://localhost:5173         → Dashboard visible
-✅ Kaggle:     Training output tab open      → checkpoint ready to show
+Terminal 1:  cd backend && ../venv/bin/python main.py     → http://localhost:8000
+Terminal 2:  cd frontend && npm run dev                   → http://localhost:5173
 ```
 
-Check the topbar badge:
-- `Sim Mode` (grey) = checkpoint not yet loaded — simulation pipeline active
-- `Live Model` (green) = checkpoint loaded — real SegFormer inference active
+Top-bar badge: `Live Model` (green) = `training/checkpoints/roadrishi_finetuned.pth` is loaded;
+`Sim Mode` (grey) = no checkpoint, live upload is disabled.
+
+Have ready: one DeepGlobe validation tile (`*_sat.jpg`) and its mask (`*_mask.png`).
 
 ---
 
-## Minute 0–2 — Project Introduction
+## 1. Introduction (1 min)
 
-**Say:**  
-> "RoadRishi is an end-to-end geospatial intelligence pipeline for post-disaster road network recovery. It addresses two core problems: detecting roads under satellite imagery occlusions — tree canopy, shadows, cloud cover — and then measuring how resilient the city's road network is after a disaster."
+> "RoadRishi takes a satellite tile, segments the roads, turns the mask into a road graph,
+> repairs gaps caused by occlusions, and then asks: which intersections matter most, and which
+> route between two points is most likely to stay passable after a disaster?"
 
-**Point to:** The dashboard header, the ISRO H2S 2026 badge, the three main tabs.
+## 2. Segmentation results (1 min) — Simulation mode
 
-**Key line:**  
-> "The pipeline goes: raw satellite image → SegFormer segmentation → graph healing → urban resilience index. Every component is real — not placeholder code."
+Point to the metric cards:
+> "SegFormer MiT-B3 fine-tuned on DeepGlobe reaches 0.71 mIoU on a held-out 10 % split. That's
+> the mean of road and background IoU — road IoU alone is about 0.45, which is the number I'd
+> push on next."
 
----
+Be explicit that the map in Simulation mode is an illustrative demo scene.
 
-## Minute 2–5 — Preprocessing & Segmentation Tab
+## 3. Live model (3 min)
 
-1. Click **Segmentation** tab (should already be active)
-2. Point to the **4 metric cards**:
-   - mIoU: 0.783 — "above our 0.75 target threshold"
-   - Occlusion-Recall: 0.691 — "roads recovered from under canopy occlusions"
-   - Relaxed IoU: 0.847 — "with a 4-pixel (23m) buffer, standard for road evaluation"
+1. Data Source → **Live Model**, upload the tile and its ground-truth mask, **Run Live Segmentation**.
+2. Point to the Live Result panel:
+   > "The mask is skeletonised into a graph. Components went from N to M after healing —
+   > healing links dangling road ends using distance, direction, and how much road
+   > probability lies along the gap. Kruskal accepts links that join components; a second
+   > pass closes gaps inside a component when the detour around them is much longer."
+3. Metric cards now say **Measured** — real IoU / Dice against the uploaded mask.
+4. Routes: white dotted = shortest, orange = risk-adjusted.
+   > "Each edge has an existence probability. The risk-adjusted route minimises length plus
+   > λ times the negative log of that probability, i.e. it trades distance for the chance
+   > that every edge on the route is passable."
+5. Optional: enter the tile's bounds to conflate with OpenStreetMap — OSM roads are coloured by
+   how strongly the model sees them (green seen, red unseen: occluded, flooded or missing).
 
-3. Point to the **Leaflet satellite map** center panel:
-   > "This is Bengaluru's Koramangala area rendered with Esri satellite tiles. The cyan lines are predicted road segments from the SegFormer model."
+## 4. Real OSM network (3 min)
 
-4. Toggle **Before → After Healing** in the left sidebar:
-   > "Before healing, 45% connectivity. After our MST gap-healing algorithm reconnects the dangling endpoints, connectivity jumps to 78% — a 73% improvement."
+1. Data Source → **Real OSM**, Bengaluru, Disruption **Bridge Attack**, 30 %, **Load OSM Graph**.
+   (If OSM is unreachable the toast says *Synthetic grid* — say so.)
+2. > "Bridge attack removes the highest edge-betweenness roads — the targeted worst case.
+   > The green dashed edges are the repair plan: Kruskal over the damaged roads, i.e. the
+   > minimum total repair length that reconnects the network."
+3. Point to RI disrupted → repaired and MC E[LCC] / P(connected):
+   > "RI combines the largest-connected-component ratio with the Fiedler value. The Monte Carlo
+   > numbers come from sampling road failures at the hazard rate and repairs at their
+   > completion probability."
+4. Click two nodes → *Set origin* / *Set destination*; drag the **λ** slider and watch the
+   risk-adjusted route change.
 
-5. Click the **Layers** icon (top-right of map) → enable `Occlusion Zones`:
-   > "The purple regions are tree canopy and building shadow zones where the model's logits drop — exactly what the hidden BCE loss term penalizes during training."
+## 5. Risk quadrants (1 min) — on the map
 
----
+Node colours on the map (Live / Real OSM modes) are the real quadrants; click a red node:
+> "Each node's betweenness is computed across the Monte Carlo samples. High mean and high σ
+> is CRITICAL: important and fragile — that's where you'd re-task a satellite first."
 
-## Minute 5–8 — Real OSM Graph (Switch to Real OSM Mode)
+(The Graph Analysis and Resilience tabs are still illustrative demo data — don't present them
+as results.)
 
-1. In the left sidebar → **Data Source** → click **Real OSM**
-2. City is already **Bengaluru** ✓
-3. Disruption Mode: select **Bridge Attack (BC)**
-4. Disruption Intensity: set to **30%**
-5. Click **Load OSM Graph**
+## 6. Close (1 min)
 
-**While loading, say:**
-> "We're now fetching the real OpenStreetMap road network for Bengaluru using `osmnx`. This is actual city topology — not synthetic — with real node connectivity."
-
-**After it loads:**
-> "The blue summary card shows: real node and edge counts from OSM, and the Urban Resilience Index computed on the actual network after simulating a targeted bridge attack — removing the 30% highest-betweenness edges, which is what a deliberate infrastructure attack looks like."
-
-6. Try switching mode to **Cascade Failure** → **Load OSM Graph** again:
-   > "In cascade mode, we iteratively remove the edge that, at each step, has the highest betweenness centrality — simulating how failures propagate through the network."
-
----
-
-## Minute 8–11 — Graph Analysis Tab (Risk Quadrant Matrix)
-
-1. Click **Graph Analysis** tab
-2. Point to the **2×2 Risk Quadrant matrix**:
-   > "Each node is mapped into one of four quadrants based on its mean betweenness centrality and standard deviation across 30 Monte Carlo graph samples."
-   - **CRITICAL** (red): High BC, High σBC — high traffic, unreliable → re-task satellite here
-   - **RELIABLE** (blue): High BC, Low σBC — critical but stable
-   - **UNCERTAIN** (yellow): Low BC, High σBC — might become critical
-   - **SAFE** (green): Low BC, Low σBC — low priority
-
-3. Click a **CRITICAL** node on the map — popup shows BC and σBC values:
-   > "This node is flagged for satellite re-tasking priority. The Monte Carlo variance tells us it's sensitive to which healed edges exist — high uncertainty means its importance could spike."
+> "What I'd do next: report and improve road IoU, calibrate the edge probabilities against
+> real outcomes, and add APLS on ground-truth road graphs."
 
 ---
 
-## Minute 11–13 — Resilience Tab (RI Metrics)
+## Likely questions
 
-1. Click **Resilience** tab
-2. Point to **RI before vs. after healing**:
-   > "RI = 0.6 × (LCC ratio) + 0.4 × (Fiedler eigenvalue ratio). The Fiedler eigenvalue is the algebraic connectivity — the second smallest eigenvalue of the graph Laplacian — which measures how robustly connected the network is."
-
-3. Point to the **LCC and Fiedler** values:
-   > "After our MST healing, the Largest Connected Component grows back from 62% to 91% of original size. The Fiedler value also recovers — meaning the network isn't just connected, it's well-connected."
-
----
-
-## Minute 13–15 — Architecture Summary & Differentiators
-
-**If checkpoint is loaded (Live Model badge is green):**
-> "The SegFormer weights were fine-tuned on the DeepGlobe Road Extraction dataset — 6,000+ satellite images at 0.5m resolution — using a combined BCE + Dice loss with a hidden BCE term specifically for occluded road pixels. The checkpoint was trained on a Kaggle T4 x2 GPU."
-
-**If still in Sim Mode:**
-> "The simulation pipeline perfectly mirrors what the live model produces — same probability maps, same graph structure, same metrics. The architecture is identical; we're waiting on the Kaggle training job to complete."
-
-**Key differentiators to mention:**
-1. **Temperature Scaling calibration** — probabilistic output, not just binary mask
-2. **Composite cost function** `C(e) = w1·dist + w2·alignment + w3·path_integral + w4·(1-pe)` — geometrically-aware gap healing
-3. **Monte Carlo BC variance** — node risk quantification under uncertainty
-4. **Real OSM integration** — switch between synthetic and real city topology live
-
----
-
-## Common Judge Questions
-
-| Question | Answer |
+| Question | Honest answer |
 |---|---|
-| "What dataset?" | DeepGlobe (6,226 images, 0.5m), fine-tuned on LISS-IV style Indian terrain |
-| "Why SegFormer over U-Net?" | Hierarchical attention handles long-range context — better for roads occluded across large canopy patches |
-| "What's the Fiedler eigenvalue?" | Second-smallest eigenvalue of the graph Laplacian — measures algebraic connectivity, how quickly info can flow across the network |
-| "Why Monte Carlo?" | Healed edges have uncertain probabilities (pe). MC sampling gives us variance, not just point estimates — that's how we distinguish CRITICAL from RELIABLE nodes |
-| "Real-time?" | Yes — OSM graph loads in <2s for a city area. Segmentation inference with live model is ~1.8s per tile on GPU |
-
----
-
-## Emergency Fallback
-
-If backend is down: open `http://localhost:5173` — the frontend still shows the full simulation pipeline with all metrics, graphs, and animations. The judges can evaluate the UI and architecture without the live API.
+| What data? | DeepGlobe Road Extraction, 6,226 labelled RGB tiles at 0.5 m; seeded 90/10 split. |
+| Why mIoU and not road IoU? | mIoU is the common headline; road IoU (~0.45) is the stricter number and is logged separately. |
+| Multispectral / Indian sensors? | Not yet — the model is RGB-only. LISS-IV / Sentinel-2 are future work. |
+| Where do edge probabilities come from? | Heuristics: model confidence on detected roads, mean road probability across a healed gap, an assumed repair-completion probability, or mask support for OSM roads. Not calibrated. |
+| Why Monte Carlo? | Edges are uncertain; sampling gives a distribution of betweenness per node, separating critical-and-fragile from critical-and-stable. |
+| What's the Fiedler value? | Second-smallest eigenvalue of the graph Laplacian — algebraic connectivity; larger = harder to cut apart. |
+| Is it tested? | pytest: graph extraction on known shapes, MST optimality of repairs, Monte Carlo vs analytic probabilities, routing on hand-built graphs, API endpoints, and crash-resume of training. |

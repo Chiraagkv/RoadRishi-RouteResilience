@@ -1,6 +1,5 @@
 {
-  "id": "your-kaggle-username/roadrishi-training",
-  "_comment": "TODO: Replace 'your-kaggle-username' in 'id' with your actual Kaggle username",
+  "id": "chiraagkv/roadrishi-training",
   "title": "RoadRishi Training",
   "code_file": "kaggle_segformer_train.py",
   "language": "python",

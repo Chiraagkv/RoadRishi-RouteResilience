@@ -15,6 +15,9 @@ import networkx as nx
 try:
     import osmnx as ox
     OSMNX_AVAILABLE = True
+    # Overpass can be slow or rate-limit; fail over to the synthetic graph in ~30 s instead
+    # of osmnx's default 180 s connect timeout per retry.
+    ox.settings.requests_timeout = 30
 except ImportError:
     OSMNX_AVAILABLE = False
 
@@ -79,9 +82,13 @@ class OSMGraphLoader:
         city_name: str = "Bengaluru",
         network_type: str = "drive",
         use_cache: bool = True,
+        dist: float | None = 1500.0,
     ) -> nx.MultiDiGraph:
         """
         Fetches the OSM driveable road network for *city_name*.
+        With *dist* (metres) only the square of that half-width around the city centre is
+        fetched; dist=None fetches the whole administrative area (Bengaluru ≈ 150k nodes —
+        far too large for repeated betweenness centrality).
         Caches the result locally as a GraphML file to avoid repeated downloads.
 
         Returns a networkx MultiDiGraph with node attributes:
@@ -94,8 +101,9 @@ class OSMGraphLoader:
                 "osmnx is not installed. Run: pip install osmnx"
             )
 
+        suffix = f"_{int(dist)}m" if dist else ""
         cache_file = os.path.join(
-            self.cache_dir, f"{city_name.lower()}_{network_type}.graphml"
+            self.cache_dir, f"{city_name.lower()}_{network_type}{suffix}.graphml"
         )
 
         if use_cache and os.path.exists(cache_file):
@@ -106,11 +114,11 @@ class OSMGraphLoader:
         config = CITY_CONFIGS.get(city_name, CITY_CONFIGS["Bengaluru"])
         print(f"[OSMGraphLoader] Downloading OSM graph for {city_name} ...")
 
-        G = ox.graph_from_place(
-            config["query"],
-            network_type=network_type,
-            simplify=True,
-        )
+        if dist:
+            G = ox.graph_from_point(config["center"], dist=dist,
+                                    network_type=network_type, simplify=True)
+        else:
+            G = ox.graph_from_place(config["query"], network_type=network_type, simplify=True)
 
         # Save cache
         ox.save_graphml(G, cache_file)
@@ -139,15 +147,25 @@ class OSMGraphLoader:
         pos_dict = {}
 
         for node, data in G_proj.nodes(data=True):
-            # Use projected x/y (metres from origin) for spatial computations
+            # Use projected x/y (UTM metres) for spatial computations
             x = data.get("x", 0.0)
             y = data.get("y", 0.0)
+            # Keep the true WGS84 coordinates for display / georeferencing. (UTM metres are
+            # NOT offsets from the city centre, so they cannot go through _metres_to_latlon.)
+            raw = G_osm.nodes[node]
             # Store as (row=y, col=x) to match healing.py convention
             pos_dict[node] = (y, x)
-            G.add_node(node, pos=(y, x), osmid=data.get("osmid", node))
+            G.add_node(node, pos=(y, x), osmid=data.get("osmid", node),
+                       lat=float(raw.get("lat", raw.get("y"))),
+                       lon=float(raw.get("lon", raw.get("x"))))
 
         for u, v, data in G_proj.edges(data=True):
-            length = data.get("length", 1.0)
+            if u == v:
+                continue
+            length = float(data.get("length", 1.0))
+            # MultiDiGraph → Graph: keep the shortest parallel road
+            if G.has_edge(u, v) and G.edges[u, v]["weight"] <= length:
+                continue
             G.add_edge(u, v, weight=length)
 
         return G, pos_dict
@@ -293,8 +311,10 @@ class OSMGraphLoader:
             )
             to_remove_nodes = [n for n, _ in degree_sorted[:n_nodes_remove]]
             G_disrupted.remove_nodes_from(to_remove_nodes)
+            G_disrupted.graph["destroyed_nodes"] = to_remove_nodes
 
-        # Clean up isolated single nodes
+        # Clean up isolated single nodes (they still exist physically — repairs can
+        # reconnect them; only "destroyed_nodes" are gone for good)
         isolates = list(nx.isolates(G_disrupted))
         G_disrupted.remove_nodes_from(isolates)
 
@@ -317,13 +337,17 @@ class OSMGraphLoader:
         """
         config = CITY_CONFIGS.get(city_name, CITY_CONFIGS["Bengaluru"])
 
+        def latlon(n):
+            d = G.nodes[n]
+            if "lat" in d and "lon" in d:          # real OSM node
+                return round(d["lat"], 6), round(d["lon"], 6)
+            return _metres_to_latlon(*pos_dict[n], config["center"])   # synthetic offsets
+
         nodes_list = []
         for n in G.nodes():
             if n not in pos_dict:
                 continue
-            y, x = pos_dict[n]  # y=lat, x=lon in projected metres
-            # Convert back to approximate lat/lon for Leaflet
-            lat, lon = _metres_to_latlon(y, x, config["center"])
+            lat, lon = latlon(n)
             nodes_list.append(
                 {
                     "id": str(n),
@@ -339,8 +363,8 @@ class OSMGraphLoader:
         for u, v, d in G.edges(data=True):
             if u not in pos_dict or v not in pos_dict:
                 continue
-            u_lat, u_lon = _metres_to_latlon(*pos_dict[u], config["center"])
-            v_lat, v_lon = _metres_to_latlon(*pos_dict[v], config["center"])
+            u_lat, u_lon = latlon(u)
+            v_lat, v_lon = latlon(v)
             edges_list.append(
                 {
                     "u": str(u),
@@ -349,10 +373,102 @@ class OSMGraphLoader:
                     "v_pos": [v_lat, v_lon],
                     "healed": d.get("healed", False),
                     "weight": round(d.get("weight", 1.0), 1),
+                    "pe": round(float(d["pe"]), 3) if d.get("pe") is not None else None,
+                    "support": d.get("support"),
                 }
             )
 
         return {"nodes": nodes_list, "edges": edges_list}
+
+    # ------------------------------------------------------------------
+    # Public: OSM graph for an image footprint
+    # ------------------------------------------------------------------
+    def fetch_bbox_graph(self, bounds, network_type: str = "drive",
+                         use_cache: bool = True) -> nx.MultiDiGraph:
+        """bounds = (south, west, north, east) in WGS84 degrees."""
+        if not OSMNX_AVAILABLE:
+            raise RuntimeError("osmnx is not installed. Run: pip install osmnx")
+        s, w, n, e = bounds
+        cache_file = os.path.join(
+            self.cache_dir, f"bbox_{s:.5f}_{w:.5f}_{n:.5f}_{e:.5f}_{network_type}.graphml")
+        if use_cache and os.path.exists(cache_file):
+            return ox.load_graphml(cache_file)
+        # osmnx >= 2.0 takes bbox=(left, bottom, right, top)
+        G = ox.graph_from_bbox((w, s, e, n), network_type=network_type, simplify=True,
+                               truncate_by_edge=True)
+        ox.save_graphml(G, cache_file)
+        return G
+
+
+# ---------------------------------------------------------------------------
+# Segmentation mask → OSM graph conflation
+# ---------------------------------------------------------------------------
+def latlon_to_pixel(lat, lon, bounds, shape):
+    """WGS84 → (row, col) for a north-up image covering bounds=(south, west, north, east)."""
+    s, w, n, e = bounds
+    H, W = shape
+    return (n - lat) / (n - s) * H, (lon - w) / (e - w) * W
+
+
+def conflate_mask_with_graph(
+    G: nx.Graph,
+    prob_map,
+    bounds,
+    tolerance_px: int = 3,
+    samples_per_100px: int = 25,
+    min_inside_frac: float = 0.5,
+    pe_floor: float = 0.3,
+):
+    """
+    Scores every OSM road (edge) by how strongly the segmentation model sees it.
+
+    For each edge the straight segment between its end nodes is projected into the image
+    and sampled; `support` is the mean road probability along it, using the max
+    probability within `tolerance_px` (OSM centrelines and imagery are rarely aligned to
+    the pixel). Edges with less than `min_inside_frac` of their samples inside the image
+    are left unscored (support=None, pe unchanged).
+
+    Edge existence probability (heuristic, not calibrated):
+        pe = pe_floor + (1 − pe_floor) · support
+    so an OSM road the model cannot see (occluded by canopy, flooded, destroyed) gets a low
+    pe and is sampled out often by the Monte Carlo engine / avoided by risk-aware routing.
+
+    Writes edge attrs `support` and `pe` in place. Nodes need 'lat'/'lon' attributes.
+    Returns summary stats.
+    """
+    import numpy as np
+    from scipy import ndimage
+
+    prob = np.asarray(prob_map, dtype=np.float32)
+    H, W = prob.shape
+    pooled = ndimage.maximum_filter(prob, size=2 * tolerance_px + 1) if tolerance_px else prob
+    scored, supports = 0, []
+    for u, v, d in G.edges(data=True):
+        nu, nv = G.nodes[u], G.nodes[v]
+        if "lat" not in nu or "lat" not in nv:
+            continue
+        r0, c0 = latlon_to_pixel(nu["lat"], nu["lon"], bounds, (H, W))
+        r1, c1 = latlon_to_pixel(nv["lat"], nv["lon"], bounds, (H, W))
+        n_s = max(5, int(math.hypot(r1 - r0, c1 - c0) / 100 * samples_per_100px))
+        rr = np.linspace(r0, r1, n_s)
+        cc = np.linspace(c0, c1, n_s)
+        inside = (rr >= 0) & (rr < H) & (cc >= 0) & (cc < W)
+        if inside.mean() < min_inside_frac:
+            d["support"] = None
+            continue
+        vals = pooled[rr[inside].astype(int), cc[inside].astype(int)]
+        support = float(vals.mean())
+        d["support"] = round(support, 4)
+        d["pe"] = round(pe_floor + (1.0 - pe_floor) * support, 4)
+        supports.append(support)
+        scored += 1
+    supports = np.array(supports) if supports else np.array([0.0])
+    return {
+        "edges_total": G.number_of_edges(),
+        "edges_scored": scored,
+        "mean_support": round(float(supports.mean()), 4) if scored else None,
+        "edges_unseen": int((supports < 0.3).sum()) if scored else 0,
+    }
 
 
 # ---------------------------------------------------------------------------

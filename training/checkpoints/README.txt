@@ -1,12 +1,14 @@
-Place the trained model checkpoint here after downloading from Kaggle.
+Place the trained model checkpoint here.
 
-Expected filename: roadrishi_finetuned.pth
+Expected filename: roadrishi_finetuned.pth   (the best checkpoint written by the training script)
 
 Steps:
-1. Run training/kaggle_segformer_train.py on Kaggle (attach DeepGlobe dataset, enable GPU T4)
-2. After training completes, go to Kaggle Output panel
-3. Download roadrishi_finetuned.pth
-4. Place it in this folder: training/checkpoints/roadrishi_finetuned.pth
+1. Train with training/kaggle_segformer_train.py
+   - Kaggle: GPU T4 x2, attach DeepGlobe, use "Save Version -> Save & Run All"
+   - or locally: see README.md ("Training")
+2. Download from the output folder: roadrishi_finetuned.pth, metrics.json, history.json,
+   curves.png, predictions_grid.png (metrics.json is the source of truth for reported numbers)
+3. Put roadrishi_finetuned.pth in this folder.
 
-Once the checkpoint is here, the /api/checkpoint-status endpoint will switch from
-"simulation" mode to "live_model" mode automatically.
+The backend then switches /api/checkpoint-status from "simulation" to "live_model" automatically.
+(*.pth files are gitignored — the checkpoint is not committed.)
