@@ -29,8 +29,8 @@ Have ready: one DeepGlobe validation tile (`*_sat.jpg`) and its mask (`*_mask.pn
 ## 2. Segmentation results (1 min) — Simulation mode
 
 Point to the metric cards:
-> "SegFormer MiT-B3 fine-tuned on DeepGlobe reaches 0.71 mIoU on a held-out 10 % split. That's
-> the mean of road and background IoU — road IoU alone is about 0.45, which is the number I'd
+> "SegFormer MiT-B3 fine-tuned on DeepGlobe reaches 0.75 mIoU on 622 held-out tiles. That's
+> the mean of road and background IoU — road IoU alone is 0.54, which is the number I'd
 > push on next."
 
 Be explicit that the map in Simulation mode is an illustrative demo scene.
@@ -86,7 +86,7 @@ as results.)
 | Question | Honest answer |
 |---|---|
 | What data? | DeepGlobe Road Extraction, 6,226 labelled RGB tiles at 0.5 m; seeded 90/10 split. |
-| Why mIoU and not road IoU? | mIoU is the common headline; road IoU (~0.45) is the stricter number and is logged separately. |
+| Why mIoU and not road IoU? | mIoU is the common headline; road IoU (0.54) is the stricter number and is reported alongside it. |
 | Multispectral / Indian sensors? | Not yet — the model is RGB-only. LISS-IV / Sentinel-2 are future work. |
 | Where do edge probabilities come from? | Heuristics: model confidence on detected roads, mean road probability across a healed gap, an assumed repair-completion probability, or mask support for OSM roads. Not calibrated. |
 | Why Monte Carlo? | Edges are uncertain; sampling gives a distribution of betweenness per node, separating critical-and-fragile from critical-and-stable. |

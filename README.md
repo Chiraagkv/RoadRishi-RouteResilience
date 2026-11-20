@@ -25,23 +25,29 @@ satellite tile ──► SegFormer MiT-B3 ──► road probability map
 ## Results
 
 SegFormer MiT-B3 (ImageNet/ADE20K-pretrained) fine-tuned on the labelled DeepGlobe Road
-Extraction set (6,226 tiles, 0.5 m/px), 90/10 seeded train/validation split, 384 px input,
-2× T4 GPUs:
+Extraction set (6,226 tiles, 0.5 m/px) with a seeded 90/10 train/validation split
+(5,604 / 622 tiles), 384 px input, 14 epochs (55 min on one RTX 4050 Laptop GPU, batch 4 ×
+gradient accumulation 4). Evaluation of the best checkpoint (epoch 14) on all 622 held-out
+tiles, in fp32, with every metric computed once from dataset-level pixel counts:
 
-| Metric (held-out validation, best epoch = 3) | Value |
+| Metric (held-out validation) | Value |
 |---|---|
-| mIoU (mean of road IoU and background IoU) | **0.712** |
-| Dice / F1 (road class, averaged over validation batches) | 0.629 |
+| **Road IoU** | **0.535** |
+| Background IoU | 0.971 |
+| mIoU (mean of road and background IoU) | **0.753** |
+| Road precision / recall | 0.617 / 0.802 |
+| Road F1 (= Dice) | 0.697 |
+| Per-image road IoU: mean / median / 10th percentile | 0.547 / 0.541 / 0.369 |
 
-Road-class IoU alone is roughly 0.43–0.46 (0.43 was logged directly in a later run at mIoU 0.696;
-the 0.712 run predates separate road-IoU logging, and Dice 0.629 implies ≈ 0.46). Background IoU
-is ~0.95+ on DeepGlobe and inflates mIoU, so the current script reports road IoU separately and
-computes every metric from dataset-level pixel counts. Tiles are downsampled from 2448 px to
-384 px, so the effective ground resolution during evaluation is ~3.2 m/px, not 0.5 m.
+Roads are 4 % of pixels, so background IoU is high and inflates mIoU; road IoU is the stricter
+number. Recall is well above precision, i.e. the model tends to over-predict road width (the loss
+weights road pixels 4×). The weakest tiles are faint unpaved rural tracks. Validation loss was
+still falling at epoch 14, so longer training would likely help. Tiles are downsampled from
+2448 px to 384 px, so the effective ground resolution during evaluation is ~3.2 m/px, not 0.5 m.
 
 The training script writes `metrics.json` (held-out evaluation of the best checkpoint),
-`history.json`, `curves.png` and `predictions_grid.png` — those files are the source of truth
-for any number quoted.
+`history.json`, `curves.png` and `predictions_grid.png` to `training/checkpoints/` — those files
+are the source of truth for every number above.
 
 ---
 
@@ -94,7 +100,7 @@ run keeps going when the browser tab sleeps. Locally (e.g. a 6 GB GPU):
 
 ```bash
 venv/bin/pip install -r training/requirements_training.txt
-ROADRISHI_DATA_ROOT=data/deepglobe/train ROADRISHI_BATCH=4 ROADRISHI_ACCUM=4 \
+ROADRISHI_BATCH=4 ROADRISHI_ACCUM=4 ROADRISHI_WORKERS=6 \
     venv/bin/python training/kaggle_segformer_train.py
 ```
 
