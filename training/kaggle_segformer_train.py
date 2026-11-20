@@ -142,7 +142,7 @@ CFG = {
     "img_size":     _env("IMG", 384, int),
     "batch_size":   _env("BATCH", 8, int),     # 8 fits a T4 at 384 px with AMP; use 4 on 6 GB
     "grad_accum":   _env("ACCUM", 2, int),
-    "num_epochs":   _env("EPOCHS", 8, int),
+    "num_epochs":   _env("EPOCHS", 14, int),   # cosine restarts end at 2, 6, 14
     "lr":           _env("LR", 5e-5, float),
     "weight_decay": 1e-4,
     "val_split":    0.1,
